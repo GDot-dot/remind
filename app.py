@@ -1,10 +1,8 @@
-# ---------------------------------
-# 匯入必要的函式庫
-# ---------------------------------
+# app.py
+
 import os
 import re
-import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, abort, logging
 
 # 官方 Line Bot SDK
@@ -15,103 +13,119 @@ from linebot.models import (
     QuickReply, QuickReplyButton, PostbackAction, PostbackEvent
 )
 
-# 強大的排程與日期解析工具
+# 排程與日期工具
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from dateutil.parser import parse
+import pytz
+
+# 從我們自訂的 db 模組匯入
+from db import init_db, get_db, Event
 
 # ---------------------------------
 # 初始化設定
 # ---------------------------------
 app = Flask(__name__)
- # LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN', 'J450DanejGuyYScLjdWl8/MOzCJkJiGg3xyD9EnNSVv2YnbJhjsNctsZ7KLoZuYSHvD/SyMMj3qt/Rw+NEI6DsHk8n7qxJ4siyYKY3QxhrDnvJiuQqIN1AMcY5+oC4bRTeNOBPJTCLseJBE2pFmqugdB04t89/1O/w1cDnyilFU=')
-    # LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET', '74df866d9f3f4c47f3d5e86d67fcb673')
-
 
 # 從 Render 的環境變數讀取憑證
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN' , 'J450DanejGuyYScLjdWl8/MOzCJkJiGg3xyD9EnNSVv2YnbJhjsNctsZ7KLoZuYSHvD/SyMMj3qt/Rw+NEI6DsHk8n7qxJ4siyYKY3QxhrDnvJiuQqIN1AMcY5+oC4bRTeNOBPJTCLseJBE2pFmqugdB04t89/1O/w1cDnyilFU=')
-LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET', '74df866d9f3f4c47f3d5e86d67fcb673' )
-DB_PATH = 'reminders_v2.db' # 維持 v2，確保使用新的資料庫
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN','LINE_CHANNEL_ACCESS_TOKEN', 'J450DanejGuyYScLjdWl8/MOzCJkJiGg3xyD9EnNSVv2YnbJhjsNctsZ7KLoZuYSHvD/SyMMj3qt/Rw+NEI6DsHk8n7qxJ4siyYKY3QxhrDnvJiuQqIN1AMcY5+oC4bRTeNOBPJTCLseJBE2pFmqugdB04t89/1O/w1cDnyilFU=')
+LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET', '74df866d9f3f4c47f3d5e86d67fcb673')
+DATABASE_URL = os.getenv('DATABASE_URL','postgresql://remine_db_user:Gxehx2wmgDUSZenytj4Sd4r0Z6UHE4Xp@dpg-d1qcfms9c44c739ervm0-a/remine_db')
 
-# ---------------------------------
-# 資料庫輔助函式
-# ---------------------------------
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                creator_user_id TEXT NOT NULL,
-                target_user_id TEXT NOT NULL,
-                target_display_name TEXT NOT NULL,
-                event_content TEXT NOT NULL,
-                event_datetime TEXT NOT NULL,
-                reminder_time TEXT,
-                reminder_sent INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-    app.logger.info("Database initialized successfully.")
+if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, DATABASE_URL]):
+    app.logger.error("Required environment variables are not set.")
+    # 在實際部署中，你可能希望應用程式在此處停止啟動
+    # raise ValueError("Missing critical environment variables")
 
-# 【最終校對】將初始化函式移到這裡，確保在 gunicorn 啟動時也能執行
+# 初始化資料庫 (建立表格)
 init_db()
 
-# 初始化 API 和排程器
+# 設定排程器使用 PostgreSQL 作為儲存後端
+jobstores = {
+    'default': SQLAlchemyJobStore(url=DATABASE_URL)
+}
+scheduler = BackgroundScheduler(jobstores=jobstores, timezone=pytz.timezone('Asia/Taipei'))
+
+# 啟動排程器
+scheduler.start()
+app.logger.info("Scheduler started with SQLAlchemyJobStore.")
+
+# 初始化 LINE Bot API
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-scheduler = BackgroundScheduler(timezone='Asia/Taipei')
 
-# 【最終校對】排程器也應該在這裡啟動
-scheduler.start()
-app.logger.info("Scheduler started successfully.")
 
+# ---------------------------------
+# 資料庫輔助函式 (使用 SQLAlchemy)
+# ---------------------------------
 def add_event(creator_id, target_id, display_name, content, event_dt):
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO events (creator_user_id, target_user_id, target_display_name, event_content, event_datetime) VALUES (?, ?, ?, ?, ?)",
-            (creator_id, target_id, display_name, content, event_dt.isoformat())
-        )
-        conn.commit()
-        return cursor.lastrowid
+    db_gen = get_db()
+    db = next(db_gen)
+    new_event = Event(
+        creator_user_id=creator_id,
+        target_user_id=target_id,
+        target_display_name=display_name,
+        event_content=content,
+        event_datetime=event_dt
+    )
+    db.add(new_event)
+    db.commit()
+    db.refresh(new_event)
+    event_id = new_event.id
+    db.close()
+    return event_id
 
 def update_reminder_time(event_id, reminder_dt):
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE events SET reminder_time = ? WHERE id = ?", (reminder_dt.isoformat() if reminder_dt else None, event_id))
-        conn.commit()
+    db_gen = get_db()
+    db = next(db_gen)
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if event:
+        event.reminder_time = reminder_dt
+        db.commit()
+    db.close()
 
 def get_event(event_id):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM events WHERE id = ?", (event_id,))
-        return cursor.fetchone()
+    db_gen = get_db()
+    db = next(db_gen)
+    event = db.query(Event).filter(Event.id == event_id).first()
+    db.close()
+    return event
 
 # ---------------------------------
 # 排程任務
 # ---------------------------------
 def send_reminder(event_id):
-    app.logger.info(f"Executing reminder for event_id: {event_id}")
-    event = get_event(event_id)
-    if event and not event['reminder_sent']:
-        target_id = event['target_user_id']
-        display_name = event['target_display_name']
-        event_dt = datetime.fromisoformat(event['event_datetime'])
-        event_content = event['event_content']
-        reminder_message = f"⏰ 提醒！\n\n{display_name}\n記得在 {event_dt.strftime('%Y/%m/%d %H:%M')} 要「{event_content}」喔！"
-        try:
-            line_bot_api.push_message(target_id, TextSendMessage(text=reminder_message))
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.cursor().execute("UPDATE events SET reminder_sent = 1 WHERE id = ?", (event_id,))
-                conn.commit()
-            app.logger.info(f"Reminder sent successfully for event_id: {event_id}")
-        except LineBotApiError as e:
-            app.logger.error(f"Scheduler: Failed to push message for event_id {event_id}. Error: {e}")
+    # 在排程任務中，我們需要重新初始化 app context 以便存取資料庫和 log
+    with app.app_context():
+        app.logger.info(f"Executing reminder for event_id: {event_id}")
+        event = get_event(event_id)
+        if event and not event.reminder_sent:
+            target_id = event.target_user_id
+            display_name = event.target_display_name
+            event_dt = event.event_datetime.astimezone(pytz.timezone('Asia/Taipei'))
+            event_content = event.event_content
+            reminder_message = f"⏰ 提醒！\n\n@{display_name}\n記得在 {event_dt.strftime('%Y/%m/%d %H:%M')} 要「{event_content}」喔！"
+            
+            try:
+                line_bot_api.push_message(target_id, TextSendMessage(text=reminder_message))
+                
+                # 更新資料庫中的發送狀態
+                db_gen = get_db()
+                db = next(db_gen)
+                db_event = db.query(Event).filter(Event.id == event_id).first()
+                if db_event:
+                    db_event.reminder_sent = 1
+                    db.commit()
+                db.close()
+                app.logger.info(f"Reminder sent successfully for event_id: {event_id}")
+
+            except LineBotApiError as e:
+                app.logger.error(f"Scheduler: Failed to push message for event_id {event_id}. Error: {e}")
+        else:
+             app.logger.warning(f"Skipping reminder for event_id {event_id}. Event not found or already sent.")
 
 # ---------------------------------
-# Webhook 路由 (這是最關鍵的部分！)
+# Webhook 路由
 # ---------------------------------
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -136,7 +150,8 @@ def handle_message(event):
     text = event.message.text.strip()
     creator_user_id = event.source.user_id
     
-    match = re.match(r'^提醒\s+(\S+)\s+([\d/]+\s+[\d:]+)\s+(.+)$', text)
+    # 提醒 我 2025/07/15 17:20 最終測試
+    match = re.match(r'^提醒\s+(\S+)\s+([\d/\s:]+)\s+(.+)$', text)
 
     if not match: return
 
@@ -145,14 +160,25 @@ def handle_message(event):
     content = match.group(3).strip()
 
     if who_to_remind_text == '我':
-        target_user_id = creator_user_id
-        target_display_name = "您"
+        try:
+            profile = line_bot_api.get_profile(creator_user_id)
+            target_user_id = creator_user_id
+            target_display_name = profile.display_name
+        except LineBotApiError as e:
+            app.logger.error(f"Could not get profile for user {creator_user_id}: {e}")
+            target_user_id = creator_user_id
+            target_display_name = "您" # 備用名稱
     else:
-        target_user_id = event.source.sender_id
-        target_display_name = f"@{who_to_remind_text}"
+        # 注意：在群組中，你無法輕易透過 @名字 取得 userID，這裡先簡化處理
+        target_user_id = creator_user_id # 暫時先提醒自己，這部分功能較複雜
+        target_display_name = who_to_remind_text
 
     try:
-        event_dt = parse(datetime_str, yearfirst=False)
+        # 解析時間並設定時區為台北
+        naive_dt = parse(datetime_str, yearfirst=False)
+        taipei_tz = pytz.timezone('Asia/Taipei')
+        event_dt = taipei_tz.localize(naive_dt)
+
         event_id = add_event(creator_user_id, target_user_id, target_display_name, content, event_dt)
         
         quick_reply_buttons = QuickReply(items=[
@@ -188,7 +214,7 @@ def handle_postback(event):
         event_record = get_event(event_id)
         if not event_record: return
 
-        event_dt = datetime.fromisoformat(event_record['event_datetime'])
+        event_dt = event_record.event_datetime
         reminder_dt = None
         
         if reminder_type == 'none':
@@ -202,8 +228,17 @@ def handle_postback(event):
             
             if delta:
                 reminder_dt = event_dt - delta
-                scheduler.add_job(send_reminder, 'date', run_date=reminder_dt, args=[event_id])
-                reply_msg_text = f"設定完成！將於 {reminder_dt.strftime('%Y/%m/%d %H:%M')} 提醒您。"
+                # 使用 APScheduler 新增任務
+                scheduler.add_job(
+                    send_reminder, 
+                    'date', 
+                    run_date=reminder_dt, 
+                    args=[event_id],
+                    id=f'reminder_{event_id}', # 給予一個唯一的 job ID
+                    replace_existing=True # 如果已存在相同ID的任務，則替換它
+                )
+                app.logger.info(f"Scheduled job for event_id {event_id} at {reminder_dt}")
+                reply_msg_text = f"設定完成！將於 {reminder_dt.astimezone(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M')} 提醒您。"
             else:
                 reply_msg_text = "設定提醒時發生未知的錯誤。"
         
@@ -211,9 +246,10 @@ def handle_postback(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg_text))
 
 # ---------------------------------
-# 主程式進入點 (只在本地執行 `python app.py` 時有用)
+# 主程式進入點
 # ---------------------------------
 if __name__ == "__main__":
+    # 為了讓 ngrok 在本地測試時能運作
     port = int(os.environ.get('PORT', 5001))
     app.run(host='0.0.0.0', port=port)
     
