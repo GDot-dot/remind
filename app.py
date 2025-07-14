@@ -31,7 +31,7 @@ LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET', '74df866d9f3f4c47f3d5e86d
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 scheduler = BackgroundScheduler(timezone='Asia/Taipei')
-DB_PATH = 'reminders.db'
+DB_PATH = 'reminders_v2.db'
 
 # ---------------------------------
 # 資料庫輔助函式 (已更新結構)
