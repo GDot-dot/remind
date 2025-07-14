@@ -1,6 +1,6 @@
-# db.py
+# db.py (修正後版本)
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, String, Text, TIMESTAMP, DateTime
 
@@ -26,7 +26,8 @@ class Event(Base):
     event_datetime = Column(DateTime(timezone=True), nullable=False)
     reminder_time = Column(DateTime(timezone=True), nullable=True)
     reminder_sent = Column(Integer, default=0)
-    created_at = Column(TIMESTAMP, server_default='CURRENT_TIMESTAMP')
+    # 使用 func.now() 來設定伺服器端的預設時間
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
 # 提供一個函式來取得資料庫 session
 def get_db():
@@ -38,6 +39,8 @@ def get_db():
 
 # 初始化資料庫表格的函式
 def init_db():
-    # 這會檢查資料庫中是否存在 'events' 和 'apscheduler_jobs' 表格，如果不存在則建立。
     Base.metadata.create_all(bind=engine)
     print("Database tables checked/created.")
+    
+    
+    #DATABASE_URL = os.getenv('DATABASE_URL','postgresql://remine_db_user:Gxehx2wmgDUSZenytj4Sd4r0Z6UHE4Xp@dpg-d1qcfms9c44c739ervm0-a/remine_db')
