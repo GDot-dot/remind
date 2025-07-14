@@ -5,8 +5,9 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timedelta
-from flask import Flask, request, abort
+from flask import Flask, request, abort, logging
 
+# 官方 Line Bot SDK
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
@@ -14,6 +15,7 @@ from linebot.models import (
     QuickReply, QuickReplyButton, PostbackAction, PostbackEvent
 )
 
+# 強大的排程與日期解析工具
 from apscheduler.schedulers.background import BackgroundScheduler
 from dateutil.parser import parse
 
@@ -21,17 +23,17 @@ from dateutil.parser import parse
 # 初始化設定
 # ---------------------------------
 app = Flask(__name__)
-
  # LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN', 'J450DanejGuyYScLjdWl8/MOzCJkJiGg3xyD9EnNSVv2YnbJhjsNctsZ7KLoZuYSHvD/SyMMj3qt/Rw+NEI6DsHk8n7qxJ4siyYKY3QxhrDnvJiuQqIN1AMcY5+oC4bRTeNOBPJTCLseJBE2pFmqugdB04t89/1O/w1cDnyilFU=')
     # LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET', '74df866d9f3f4c47f3d5e86d67fcb673')
 
+
 # 從 Render 的環境變數讀取憑證
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
-LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
-DB_PATH = 'reminders_v2.db'
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN' , 'J450DanejGuyYScLjdWl8/MOzCJkJiGg3xyD9EnNSVv2YnbJhjsNctsZ7KLoZuYSHvD/SyMMj3qt/Rw+NEI6DsHk8n7qxJ4siyYKY3QxhrDnvJiuQqIN1AMcY5+oC4bRTeNOBPJTCLseJBE2pFmqugdB04t89/1O/w1cDnyilFU=')
+LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET', '74df866d9f3f4c47f3d5e86d67fcb673' )
+DB_PATH = 'reminders_v2.db' # 維持 v2，確保使用新的資料庫
 
 # ---------------------------------
-# 資料庫輔助函式 (結構不變)
+# 資料庫輔助函式
 # ---------------------------------
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -50,9 +52,9 @@ def init_db():
             )
         """)
         conn.commit()
-        print("Database initialized.") # 加上日誌，方便在 Render Log 中確認
+    app.logger.info("Database initialized successfully.")
 
-# 【V6 最終修正】將初始化函式移到這裡，確保在 gunicorn 啟動時也能執行
+# 【最終校對】將初始化函式移到這裡，確保在 gunicorn 啟動時也能執行
 init_db()
 
 # 初始化 API 和排程器
@@ -60,15 +62,74 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 scheduler = BackgroundScheduler(timezone='Asia/Taipei')
 
-# 【V6 最終修正】排程器也應該在這裡啟動
+# 【最終校對】排程器也應該在這裡啟動
 scheduler.start()
-print("Scheduler started.")
+app.logger.info("Scheduler started successfully.")
 
-# (中間所有函式，從 add_event 到 handle_postback 都不變，這裡省略以節省篇幅)
-# 您可以從您現有的程式碼中保留那些函式
+def add_event(creator_id, target_id, display_name, content, event_dt):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO events (creator_user_id, target_user_id, target_display_name, event_content, event_datetime) VALUES (?, ?, ?, ?, ?)",
+            (creator_id, target_id, display_name, content, event_dt.isoformat())
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+def update_reminder_time(event_id, reminder_dt):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE events SET reminder_time = ? WHERE id = ?", (reminder_dt.isoformat() if reminder_dt else None, event_id))
+        conn.commit()
+
+def get_event(event_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM events WHERE id = ?", (event_id,))
+        return cursor.fetchone()
 
 # ---------------------------------
-# 核心訊息處理邏輯 (V5 - 完整重構版)
+# 排程任務
+# ---------------------------------
+def send_reminder(event_id):
+    app.logger.info(f"Executing reminder for event_id: {event_id}")
+    event = get_event(event_id)
+    if event and not event['reminder_sent']:
+        target_id = event['target_user_id']
+        display_name = event['target_display_name']
+        event_dt = datetime.fromisoformat(event['event_datetime'])
+        event_content = event['event_content']
+        reminder_message = f"⏰ 提醒！\n\n{display_name}\n記得在 {event_dt.strftime('%Y/%m/%d %H:%M')} 要「{event_content}」喔！"
+        try:
+            line_bot_api.push_message(target_id, TextSendMessage(text=reminder_message))
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.cursor().execute("UPDATE events SET reminder_sent = 1 WHERE id = ?", (event_id,))
+                conn.commit()
+            app.logger.info(f"Reminder sent successfully for event_id: {event_id}")
+        except LineBotApiError as e:
+            app.logger.error(f"Scheduler: Failed to push message for event_id {event_id}. Error: {e}")
+
+# ---------------------------------
+# Webhook 路由 (這是最關鍵的部分！)
+# ---------------------------------
+@app.route("/callback", methods=['POST'])
+def callback():
+    signature = request.headers['X-Line-Signature']
+    body = request.get_data(as_text=True)
+    app.logger.info(f"Request body: {body}")
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        app.logger.error("Invalid signature. Please check your channel secret.")
+        abort(400)
+    except Exception as e:
+        app.logger.error(f"Error occurred in callback: {e}")
+        abort(500)
+    return 'OK'
+
+# ---------------------------------
+# 核心訊息處理邏輯
 # ---------------------------------
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
@@ -107,17 +168,50 @@ def handle_message(event):
             event.reply_token,
             TextSendMessage(text=reply_text, quick_reply=quick_reply_buttons)
         )
-    except (ValueError, Exception) as e:
-        app.logger.error(f"Error during event processing: {e}")
+    except Exception as e:
+        app.logger.error(f"Error in handle_message: {e}")
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="處理請求時發生錯誤，請檢查日期時間格式。")
+            TextSendMessage(text="處理請求時發生錯誤，請檢查指令格式。")
         )
-        
-# ... handle_postback 和 send_reminder 函式請保留您原本的 ...
 
 # ---------------------------------
-# 主程式進入點 (現在只剩下 app.run)
+# Postback 事件處理
+# ---------------------------------
+@handler.add(PostbackEvent)
+def handle_postback(event):
+    data = dict(x.split('=') for x in event.postback.data.split('&'))
+    action = data.get('action')
+    if action == 'set_reminder':
+        event_id = int(data.get('id'))
+        reminder_type = data.get('type')
+        event_record = get_event(event_id)
+        if not event_record: return
+
+        event_dt = datetime.fromisoformat(event_record['event_datetime'])
+        reminder_dt = None
+        
+        if reminder_type == 'none':
+            reply_msg_text = "好的，這個事件將不設定提醒。"
+        else:
+            value = int(data.get('val'))
+            delta = timedelta()
+            if reminder_type == 'day': delta = timedelta(days=value)
+            elif reminder_type == 'hour': delta = timedelta(hours=value)
+            elif reminder_type == 'minute': delta = timedelta(minutes=value)
+            
+            if delta:
+                reminder_dt = event_dt - delta
+                scheduler.add_job(send_reminder, 'date', run_date=reminder_dt, args=[event_id])
+                reply_msg_text = f"設定完成！將於 {reminder_dt.strftime('%Y/%m/%d %H:%M')} 提醒您。"
+            else:
+                reply_msg_text = "設定提醒時發生未知的錯誤。"
+        
+        update_reminder_time(event_id, reminder_dt)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg_text))
+
+# ---------------------------------
+# 主程式進入點 (只在本地執行 `python app.py` 時有用)
 # ---------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5001))
