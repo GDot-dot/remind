@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 import sqlite3
 
 # 定義資料庫檔案的名稱
