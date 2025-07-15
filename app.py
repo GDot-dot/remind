@@ -18,7 +18,7 @@ from linebot.models import (
 
 # 排程與日期工具
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.executors.pool import ThreadPoolExecutor
 from dateutil.parser import parse
 import pytz
@@ -55,9 +55,9 @@ if not DATABASE_URL:
 TAIPEI_TZ = pytz.timezone('Asia/Taipei')
 UTC_TZ = pytz.UTC
 
-# 使用 Memory JobStore（更適合免費方案）
+
 jobstores = {
-    'default': MemoryJobStore()
+    'default': SQLAlchemyJobStore(url=DATABASE_URL)
 }
 
 # 優化執行器設定
@@ -202,6 +202,31 @@ def mark_reminder_sent(event_id):
         return safe_db_operation(_mark_sent)
     except Exception as e:
         logger.error(f"Failed to mark reminder as sent: {e}")
+        return False
+
+def reset_reminder_sent_status(event_id):
+    """重置提醒發送狀態"""
+    def _reset_status():
+        db_gen = get_db()
+        db = next(db_gen)
+        try:
+            event = db.query(Event).filter(Event.id == event_id).first()
+            if event:
+                event.reminder_sent = 0
+                db.commit()
+                return True
+            return False
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error resetting reminder status: {e}")
+            raise
+        finally:
+            db.close()
+
+    try:
+        return safe_db_operation(_reset_status)
+    except Exception as e:
+        logger.error(f"Failed to reset reminder status: {e}")
         return False
 
 # ---------------------------------
@@ -586,6 +611,9 @@ def handle_postback(event):
             event_id = int(data.get('id'))
             minutes = int(data.get('minutes', 5))
             
+            if not reset_reminder_sent_status(event_id):
+            logger.error(f"Failed to reset reminder status for snooze, event_id: {event_id}")
+            
             # 重新排程提醒
             snooze_time = datetime.now(TAIPEI_TZ) + timedelta(minutes=minutes)
             
@@ -593,7 +621,7 @@ def handle_postback(event):
                 send_reminder,
                 snooze_time,
                 [event_id],
-                f'snooze_{event_id}'
+                f'reminder_{event_id}'
             )
             
             if success:
