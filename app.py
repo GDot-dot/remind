@@ -612,17 +612,17 @@ def handle_postback(event):
             minutes = int(data.get('minutes', 5))
             
             if not reset_reminder_sent_status(event_id):
-            logger.error(f"Failed to reset reminder status for snooze, event_id: {event_id}")
+                logger.error(f"Failed to reset reminder status for snooze, event_id: {event_id}")
             
             # 重新排程提醒
-            snooze_time = datetime.now(TAIPEI_TZ) + timedelta(minutes=minutes)
+                snooze_time = datetime.now(TAIPEI_TZ) + timedelta(minutes=minutes)
             
-            success = safe_add_job(
-                send_reminder,
-                snooze_time,
-                [event_id],
-                f'reminder_{event_id}'
-            )
+                success = safe_add_job(
+                    send_reminder,
+                    snooze_time,
+                    [event_id],
+                    f'reminder_{event_id}'
+                )
             
             if success:
                 line_bot_api.reply_message(
