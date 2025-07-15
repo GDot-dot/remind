@@ -43,11 +43,30 @@ init_db()
 jobstores = {
     'default': SQLAlchemyJobStore(url=DATABASE_URL)
 }
-scheduler = BackgroundScheduler(jobstores=jobstores, timezone=pytz.timezone('Asia/Taipei'))
+job_defaults = {
+    'coalesce': False,
+    'max_instances': 3,
+    'misfire_grace_time': 30
+}
+scheduler = BackgroundScheduler(
+    jobstores=jobstores, 
+    job_defaults=job_defaults,
+    timezone=pytz.timezone('Asia/Taipei')
+)
 
 # 啟動排程器
-scheduler.start()
-app.logger.info("Scheduler started with SQLAlchemyJobStore.")
+try:
+    scheduler.start()
+    app.logger.info("Scheduler started with SQLAlchemyJobStore.")
+except Exception as e:
+    app.logger.error(f"Failed to start scheduler: {e}")
+    # 如果排程器啟動失敗，嘗試清除舊任務後重新啟動
+    try:
+        scheduler.remove_all_jobs()
+        scheduler.start()
+        app.logger.info("Scheduler restarted after clearing jobs.")
+    except Exception as e2:
+        app.logger.error(f"Failed to restart scheduler: {e2}")
 
 # 初始化 LINE Bot API
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
@@ -211,9 +230,14 @@ def parse_datetime(datetime_str):
 # ---------------------------------
 @app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers['X-Line-Signature']
+    signature = request.headers.get('X-Line-Signature')
+    if not signature:
+        app.logger.error("No signature found in request headers")
+        abort(400)
+        
     body = request.get_data(as_text=True)
-    app.logger.info(f"Request body: {body}")
+    app.logger.info(f"Request body length: {len(body)}")
+    
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
@@ -395,6 +419,12 @@ def handle_postback(event):
                         return
                     
                     try:
+                        # 檢查是否已存在相同的任務
+                        existing_job = scheduler.get_job(f'reminder_{event_id}')
+                        if existing_job:
+                            scheduler.remove_job(f'reminder_{event_id}')
+                            app.logger.info(f"Removed existing job for event_id {event_id}")
+                        
                         # 使用 APScheduler 新增任務
                         scheduler.add_job(
                             send_reminder, 
@@ -432,13 +462,18 @@ def handle_postback(event):
             snooze_time = datetime.now(pytz.timezone('Asia/Taipei')) + timedelta(minutes=minutes)
             
             try:
+                # 檢查是否已存在相同的任務
+                existing_job = scheduler.get_job(f'snooze_{event_id}')
+                if existing_job:
+                    scheduler.remove_job(f'snooze_{event_id}')
+                
                 scheduler.add_job(
                     send_reminder,
                     'date',
                     run_date=snooze_time,
                     args=[event_id],
-                    id=f'snooze_{event_id}_{int(snooze_time.timestamp())}',
-                    replace_existing=False
+                    id=f'snooze_{event_id}',
+                    replace_existing=True
                 )
                 line_bot_api.reply_message(
                     event.reply_token,
