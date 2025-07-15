@@ -9,8 +9,14 @@ DATABASE_URL = os.getenv('DATABASE_URL','postgresql://remine_db_user:Gxehx2wmgDU
 if not DATABASE_URL:
     raise ValueError("No DATABASE_URL set for Flask application")
 
-# 建立資料庫引擎
-engine = create_engine(DATABASE_URL)
+# 建立資料庫引擎 - 增加連線池設定
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=10,
+    max_overflow=20,
+    pool_recycle=3600,
+    pool_pre_ping=True
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -39,8 +45,20 @@ def get_db():
 
 # 初始化資料庫表格的函式
 def init_db():
-    Base.metadata.create_all(bind=engine)
-    print("Database tables checked/created.")
-    
-    
-    #DATABASE_URL = os.getenv('DATABASE_URL','postgresql://remine_db_user:Gxehx2wmgDUSZenytj4Sd4r0Z6UHE4Xp@dpg-d1qcfms9c44c739ervm0-a/remine_db')
+    try:
+        Base.metadata.create_all(bind=engine)
+        print("Database tables checked/created.")
+    except Exception as e:
+        print(f"Error creating database tables: {e}")
+        raise
+
+# 測試資料庫連線的函式
+def test_db_connection():
+    try:
+        with engine.connect() as connection:
+            result = connection.execute("SELECT 1")
+            print("Database connection successful!")
+            return True
+    except Exception as e:
+        print(f"Database connection failed: {e}")
+        return False
