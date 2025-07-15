@@ -1,4 +1,4 @@
-# app.py (修復版本)
+# app.py (完整修復版本)
 
 import os
 import re
@@ -51,6 +51,10 @@ if not DATABASE_URL:
     logger.error("DATABASE_URL is not set")
     exit(1)
 
+# 設定時區常數
+TAIPEI_TZ = pytz.timezone('Asia/Taipei')
+UTC_TZ = pytz.UTC
+
 # 使用 Memory JobStore（更適合免費方案）
 jobstores = {
     'default': MemoryJobStore()
@@ -70,11 +74,12 @@ job_defaults = {
 # 線程鎖
 scheduler_lock = threading.Lock()
 
+# 重要：排程器使用UTC時區
 scheduler = BackgroundScheduler(
     jobstores=jobstores,
     executors=executors,
     job_defaults=job_defaults,
-    timezone=pytz.timezone('Asia/Taipei')
+    timezone=UTC_TZ  # 使用UTC時區
 )
 
 # 安全啟動排程器
@@ -83,7 +88,7 @@ def safe_start_scheduler():
         try:
             if not scheduler.running:
                 scheduler.start()
-                logger.info("Scheduler started successfully")
+                logger.info("Scheduler started successfully with UTC timezone")
         except Exception as e:
             logger.error(f"Failed to start scheduler: {e}")
 
@@ -207,6 +212,8 @@ def send_reminder(event_id):
     try:
         with app.app_context():
             logger.info(f"Executing reminder for event_id: {event_id}")
+            logger.info(f"Current UTC time: {datetime.now(UTC_TZ)}")
+            logger.info(f"Current Taipei time: {datetime.now(TAIPEI_TZ)}")
             
             event = get_event(event_id)
             if not event or event.reminder_sent:
@@ -215,8 +222,17 @@ def send_reminder(event_id):
             
             target_id = event.target_user_id
             display_name = event.target_display_name
-            event_dt = event.event_datetime.astimezone(pytz.timezone('Asia/Taipei'))
+            
+            # 確保事件時間是台北時區
+            event_dt = event.event_datetime
+            if event_dt.tzinfo is None:
+                event_dt = TAIPEI_TZ.localize(event_dt)
+            else:
+                event_dt = event_dt.astimezone(TAIPEI_TZ)
+            
             event_content = event.event_content
+            
+            logger.info(f"Sending reminder to {target_id} for event at {event_dt}")
             
             # 建立確認模板
             confirm_template = ConfirmTemplate(
@@ -245,6 +261,8 @@ def send_reminder(event_id):
             
     except Exception as e:
         logger.error(f"Error in send_reminder for event_id {event_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 # ---------------------------------
 # 安全的排程器操作
@@ -262,16 +280,28 @@ def safe_add_job(func, run_date, args, job_id):
             except:
                 pass
             
+            # 確保使用UTC時間給排程器
+            if run_date.tzinfo is None:
+                run_date_utc = UTC_TZ.localize(run_date)
+            else:
+                run_date_utc = run_date.astimezone(UTC_TZ)
+            
             # 添加新任務
             scheduler.add_job(
                 func,
                 'date',
-                run_date=run_date,
+                run_date=run_date_utc,
                 args=args,
                 id=job_id,
                 replace_existing=True
             )
-            logger.info(f"Successfully scheduled job: {job_id} at {run_date}")
+            
+            # 日誌顯示兩種時間格式
+            taipei_time = run_date_utc.astimezone(TAIPEI_TZ)
+            logger.info(f"Successfully scheduled job: {job_id}")
+            logger.info(f"  UTC time: {run_date_utc}")
+            logger.info(f"  Taipei time: {taipei_time}")
+            
             return True
     except Exception as e:
         logger.error(f"Error scheduling job {job_id}: {e}")
@@ -375,10 +405,10 @@ def handle_message(event):
 
         # 處理特殊日期
         if date_str == '明天':
-            tomorrow = datetime.now() + timedelta(days=1)
+            tomorrow = datetime.now(TAIPEI_TZ) + timedelta(days=1)
             date_str = tomorrow.strftime('%Y/%m/%d')
         elif date_str == '後天':
-            day_after_tomorrow = datetime.now() + timedelta(days=2)
+            day_after_tomorrow = datetime.now(TAIPEI_TZ) + timedelta(days=2)
             date_str = day_after_tomorrow.strftime('%Y/%m/%d')
         
         # 組合日期和時間
@@ -405,17 +435,17 @@ def handle_message(event):
                 TextSendMessage(text="❌ 時間格式有誤，請檢查後重新輸入。")
             )
             return
-            
-        taipei_tz = pytz.timezone('Asia/Taipei')
         
-        # 設定時區
+        # 設定時區 - 強制轉換為台北時區
         if naive_dt.tzinfo is None:
-            event_dt = taipei_tz.localize(naive_dt)
+            event_dt = TAIPEI_TZ.localize(naive_dt)
         else:
-            event_dt = naive_dt.astimezone(taipei_tz)
+            event_dt = naive_dt.astimezone(TAIPEI_TZ)
         
         # 檢查時間是否在過去
-        current_time = datetime.now(taipei_tz)
+        current_time = datetime.now(TAIPEI_TZ)
+        logger.info(f"Event time: {event_dt}, Current time: {current_time}")
+        
         if event_dt <= current_time:
             line_bot_api.reply_message(
                 event.reply_token,
@@ -450,6 +480,8 @@ def handle_message(event):
         
     except Exception as e:
         logger.error(f"Error in handle_message: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         try:
             line_bot_api.reply_message(
                 event.reply_token,
@@ -480,7 +512,13 @@ def handle_postback(event):
                 )
                 return
 
+            # 確保事件時間是台北時區
             event_dt = event_record.event_datetime
+            if event_dt.tzinfo is None:
+                event_dt = TAIPEI_TZ.localize(event_dt)
+            else:
+                event_dt = event_dt.astimezone(TAIPEI_TZ)
+            
             reminder_dt = None
             
             if reminder_type == 'none':
@@ -497,10 +535,14 @@ def handle_postback(event):
                     delta = timedelta(minutes=value)
                 
                 if delta:
+                    # 計算提醒時間（台北時區）
                     reminder_dt = event_dt - delta
                     
                     # 檢查提醒時間是否在過去
-                    current_time = datetime.now(pytz.timezone('Asia/Taipei'))
+                    current_time = datetime.now(TAIPEI_TZ)
+                    logger.info(f"Current time: {current_time}")
+                    logger.info(f"Reminder time: {reminder_dt}")
+                    
                     if reminder_dt <= current_time:
                         line_bot_api.reply_message(
                             event.reply_token,
@@ -508,22 +550,26 @@ def handle_postback(event):
                         )
                         return
                     
-                    # 安全地添加任務
+                    logger.info(f"Scheduling reminder:")
+                    logger.info(f"  Event time (Taipei): {event_dt}")
+                    logger.info(f"  Reminder time (Taipei): {reminder_dt}")
+                    
+                    # 安全地添加任務 - 會自動轉換為UTC
                     success = safe_add_job(
                         send_reminder,
-                        reminder_dt,
+                        reminder_dt,  # 傳入台北時間，函式內會轉換為UTC
                         [event_id],
                         f'reminder_{event_id}'
                     )
                     
                     if success:
-                        reply_msg_text = f"✅ 設定完成！將於 {reminder_dt.astimezone(pytz.timezone('Asia/Taipei')).strftime('%Y/%m/%d %H:%M')} 提醒您。"
+                        reply_msg_text = f"✅ 設定完成！將於 {reminder_dt.strftime('%Y/%m/%d %H:%M')} 提醒您。"
                     else:
                         reply_msg_text = "❌ 設定提醒時發生錯誤。"
                 else:
                     reply_msg_text = "❌ 設定提醒時發生未知的錯誤。"
             
-            # 更新資料庫
+            # 更新資料庫 - 儲存台北時間
             if update_reminder_time(event_id, reminder_dt):
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg_text))
             else:
@@ -541,7 +587,7 @@ def handle_postback(event):
             minutes = int(data.get('minutes', 5))
             
             # 重新排程提醒
-            snooze_time = datetime.now(pytz.timezone('Asia/Taipei')) + timedelta(minutes=minutes)
+            snooze_time = datetime.now(TAIPEI_TZ) + timedelta(minutes=minutes)
             
             success = safe_add_job(
                 send_reminder,
@@ -563,6 +609,8 @@ def handle_postback(event):
                 
     except Exception as e:
         logger.error(f"Error in handle_postback: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         try:
             line_bot_api.reply_message(
                 event.reply_token,
@@ -580,7 +628,9 @@ def health_check():
     return {
         "status": "healthy", 
         "scheduler_running": scheduler.running,
-        "scheduled_jobs": len(scheduler.get_jobs()) if scheduler.running else 0
+        "scheduled_jobs": len(scheduler.get_jobs()) if scheduler.running else 0,
+        "current_utc_time": datetime.now(UTC_TZ).isoformat(),
+        "current_taipei_time": datetime.now(TAIPEI_TZ).isoformat()
     }
 
 @app.route("/", methods=['GET'])
@@ -611,7 +661,6 @@ atexit.register(cleanup)
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-    
     
   #  LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN','J450DanejGuyYScLjdWl8/MOzCJkJiGg3xyD9EnNSVv2YnbJhjsNctsZ7KLoZuYSHvD/SyMMj3qt/Rw+NEI6DsHk8n7qxJ4siyYKY3QxhrDnvJiuQqIN1AMcY5+oC4bRTeNOBPJTCLseJBE2pFmqugdB04t89/1O/w1cDnyilFU=')
 #LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET', '74df866d9f3f4c47f3d5e86d67fcb673')
