@@ -1,4 +1,4 @@
-# app.py (優化版本)
+# app.py (修復版本)
 
 import os
 import re
@@ -24,7 +24,7 @@ from dateutil.parser import parse
 import pytz
 
 # 從我們自訂的 db 模組匯入
-from db import init_db, get_db, Event
+from db import init_db, get_db, Event, safe_db_operation, cleanup_db
 
 # ---------------------------------
 # 初始化設定
@@ -35,33 +35,39 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 從 Render 的環境變數讀取憑證
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN','J450DanejGuyYScLjdWl8/MOzCJkJiGg3xyD9EnNSVv2YnbJhjsNctsZ7KLoZuYSHvD/SyMMj3qt/Rw+NEI6DsHk8n7qxJ4siyYKY3QxhrDnvJiuQqIN1AMcY5+oC4bRTeNOBPJTCLseJBE2pFmqugdB04t89/1O/w1cDnyilFU=')
-LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET', '74df866d9f3f4c47f3d5e86d67fcb673')
-DATABASE_URL = os.getenv('DATABASE_URL','postgresql://remine_db_user:Gxehx2wmgDUSZenytj4Sd4r0Z6UHE4Xp@dpg-d1qcfms9c44c739ervm0-a/remine_db')
+# 從環境變數讀取憑證
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
+LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
+DATABASE_URL = os.getenv('DATABASE_URL')
 
-if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, DATABASE_URL]):
-    logger.error("Required environment variables are not set.")
+# 檢查必要環境變數
+if not LINE_CHANNEL_ACCESS_TOKEN:
+    logger.error("LINE_CHANNEL_ACCESS_TOKEN is not set")
+    exit(1)
+if not LINE_CHANNEL_SECRET:
+    logger.error("LINE_CHANNEL_SECRET is not set")
+    exit(1)
+if not DATABASE_URL:
+    logger.error("DATABASE_URL is not set")
     exit(1)
 
-# 優化：使用 Memory JobStore 而非 SQLAlchemy（避免 DB 連接問題）
-# 在 Render 免費方案中，使用內存儲存更可靠
+# 使用 Memory JobStore（更適合免費方案）
 jobstores = {
     'default': MemoryJobStore()
 }
 
 # 優化執行器設定
 executors = {
-    'default': ThreadPoolExecutor(max_workers=2)
+    'default': ThreadPoolExecutor(max_workers=1)  # 降低為1個工作線程
 }
 
 job_defaults = {
-    'coalesce': True,  # 合併相同任務
-    'max_instances': 1,  # 每個任務最多一個實例
-    'misfire_grace_time': 60  # 增加容錯時間
+    'coalesce': True,
+    'max_instances': 1,
+    'misfire_grace_time': 30
 }
 
-# 使用線程鎖防止競爭條件
+# 線程鎖
 scheduler_lock = threading.Lock()
 
 scheduler = BackgroundScheduler(
@@ -73,137 +79,138 @@ scheduler = BackgroundScheduler(
 
 # 安全啟動排程器
 def safe_start_scheduler():
-    try:
-        if not scheduler.running:
-            scheduler.start()
-            logger.info("Scheduler started successfully with MemoryJobStore.")
-        else:
-            logger.info("Scheduler already running.")
-    except Exception as e:
-        logger.error(f"Failed to start scheduler: {e}")
+    with scheduler_lock:
+        try:
+            if not scheduler.running:
+                scheduler.start()
+                logger.info("Scheduler started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start scheduler: {e}")
 
-# 在應用程式啟動時初始化
+# 初始化
 try:
     init_db()
     safe_start_scheduler()
+    logger.info("Application initialized successfully")
 except Exception as e:
     logger.error(f"Initialization failed: {e}")
+    exit(1)
 
 # 初始化 LINE Bot API
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # ---------------------------------
-# 資料庫輔助函式 (優化版本)
+# 資料庫輔助函式
 # ---------------------------------
 def add_event(creator_id, target_id, display_name, content, event_dt):
-    """添加事件到資料庫，增加錯誤處理"""
-    try:
+    """添加事件到資料庫"""
+    def _add_event():
         db_gen = get_db()
         db = next(db_gen)
-        
-        new_event = Event(
-            creator_user_id=creator_id,
-            target_user_id=target_id,
-            target_display_name=display_name,
-            event_content=content,
-            event_datetime=event_dt
-        )
-        db.add(new_event)
-        db.commit()
-        db.refresh(new_event)
-        event_id = new_event.id
-        return event_id
-    except Exception as e:
-        logger.error(f"Error adding event: {e}")
         try:
+            new_event = Event(
+                creator_user_id=creator_id,
+                target_user_id=target_id,
+                target_display_name=display_name,
+                event_content=content,
+                event_datetime=event_dt
+            )
+            db.add(new_event)
+            db.commit()
+            db.refresh(new_event)
+            return new_event.id
+        except Exception as e:
             db.rollback()
-        except:
-            pass
-        return None
-    finally:
-        try:
+            logger.error(f"Error adding event: {e}")
+            raise
+        finally:
             db.close()
-        except:
-            pass
+
+    try:
+        return safe_db_operation(_add_event)
+    except Exception as e:
+        logger.error(f"Failed to add event: {e}")
+        return None
 
 def update_reminder_time(event_id, reminder_dt):
-    """更新提醒時間，增加錯誤處理"""
-    try:
+    """更新提醒時間"""
+    def _update_reminder():
         db_gen = get_db()
         db = next(db_gen)
-        
-        event = db.query(Event).filter(Event.id == event_id).first()
-        if event:
-            event.reminder_time = reminder_dt
-            db.commit()
-            return True
-    except Exception as e:
-        logger.error(f"Error updating reminder time: {e}")
         try:
+            event = db.query(Event).filter(Event.id == event_id).first()
+            if event:
+                event.reminder_time = reminder_dt
+                db.commit()
+                return True
+            return False
+        except Exception as e:
             db.rollback()
-        except:
-            pass
-    finally:
-        try:
+            logger.error(f"Error updating reminder time: {e}")
+            raise
+        finally:
             db.close()
-        except:
-            pass
-    return False
+
+    try:
+        return safe_db_operation(_update_reminder)
+    except Exception as e:
+        logger.error(f"Failed to update reminder time: {e}")
+        return False
 
 def get_event(event_id):
-    """獲取事件資料，增加錯誤處理"""
-    try:
+    """獲取事件資料"""
+    def _get_event():
         db_gen = get_db()
         db = next(db_gen)
-        
-        event = db.query(Event).filter(Event.id == event_id).first()
-        return event
-    except Exception as e:
-        logger.error(f"Error getting event: {e}")
-        return None
-    finally:
         try:
+            return db.query(Event).filter(Event.id == event_id).first()
+        finally:
             db.close()
-        except:
-            pass
+
+    try:
+        return safe_db_operation(_get_event)
+    except Exception as e:
+        logger.error(f"Failed to get event: {e}")
+        return None
 
 def mark_reminder_sent(event_id):
-    """標記提醒已發送，增加錯誤處理"""
-    try:
+    """標記提醒已發送"""
+    def _mark_sent():
         db_gen = get_db()
         db = next(db_gen)
-        
-        event = db.query(Event).filter(Event.id == event_id).first()
-        if event:
-            event.reminder_sent = 1
-            db.commit()
-            return True
-    except Exception as e:
-        logger.error(f"Error marking reminder as sent: {e}")
         try:
+            event = db.query(Event).filter(Event.id == event_id).first()
+            if event:
+                event.reminder_sent = 1
+                db.commit()
+                return True
+            return False
+        except Exception as e:
             db.rollback()
-        except:
-            pass
-    finally:
-        try:
+            logger.error(f"Error marking reminder as sent: {e}")
+            raise
+        finally:
             db.close()
-        except:
-            pass
-    return False
+
+    try:
+        return safe_db_operation(_mark_sent)
+    except Exception as e:
+        logger.error(f"Failed to mark reminder as sent: {e}")
+        return False
 
 # ---------------------------------
-# 排程任務 (優化版本)
+# 排程任務
 # ---------------------------------
 def send_reminder(event_id):
-    """發送提醒，增加錯誤處理和應用程式上下文"""
+    """發送提醒"""
     try:
         with app.app_context():
             logger.info(f"Executing reminder for event_id: {event_id}")
             
             event = get_event(event_id)
             if not event or event.reminder_sent:
-                logger.warning(f"Skipping reminder for event_id {event_id}. Event not found or already sent.")
+                logger.warning(f"Skipping reminder for event_id {event_id}")
                 return
             
             target_id = event.target_user_id
@@ -236,10 +243,8 @@ def send_reminder(event_id):
             mark_reminder_sent(event_id)
             logger.info(f"Reminder sent successfully for event_id: {event_id}")
             
-    except LineBotApiError as e:
-        logger.error(f"LINE API Error for event_id {event_id}: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error in send_reminder for event_id {event_id}: {e}")
+        logger.error(f"Error in send_reminder for event_id {event_id}: {e}")
 
 # ---------------------------------
 # 安全的排程器操作
@@ -248,18 +253,14 @@ def safe_add_job(func, run_date, args, job_id):
     """安全地添加任務到排程器"""
     try:
         with scheduler_lock:
-            # 檢查排程器是否運行
             if not scheduler.running:
                 safe_start_scheduler()
             
-            # 移除現有任務（如果存在）
+            # 移除現有任務
             try:
-                existing_job = scheduler.get_job(job_id)
-                if existing_job:
-                    scheduler.remove_job(job_id)
-                    logger.info(f"Removed existing job: {job_id}")
-            except Exception as e:
-                logger.warning(f"Error checking existing job {job_id}: {e}")
+                scheduler.remove_job(job_id)
+            except:
+                pass
             
             # 添加新任務
             scheduler.add_job(
@@ -280,9 +281,8 @@ def safe_add_job(func, run_date, args, job_id):
 # 時間解析輔助函式
 # ---------------------------------
 def parse_datetime(datetime_str):
-    """解析各種時間格式，增加錯誤處理"""
+    """解析各種時間格式"""
     try:
-        # 常見格式
         formats = [
             '%Y/%m/%d %H:%M',
             '%Y-%m-%d %H:%M',
@@ -297,11 +297,8 @@ def parse_datetime(datetime_str):
         for fmt in formats:
             try:
                 dt = datetime.strptime(datetime_str, fmt)
-                # 如果沒有年份，使用當前年份
                 if dt.year == 1900:
-                    current_year = datetime.now().year
-                    dt = dt.replace(year=current_year)
-                # 如果沒有時間，設定為當前時間
+                    dt = dt.replace(year=datetime.now().year)
                 if dt.hour == 0 and dt.minute == 0 and '%H:%M' not in fmt:
                     now = datetime.now()
                     dt = dt.replace(hour=now.hour, minute=now.minute)
@@ -309,43 +306,40 @@ def parse_datetime(datetime_str):
             except ValueError:
                 continue
         
-        # 如果以上都失敗，嘗試使用 dateutil.parser
         return parse(datetime_str, yearfirst=False)
     except Exception as e:
         logger.error(f"Error parsing datetime '{datetime_str}': {e}")
         return None
 
 # ---------------------------------
-# Webhook 路由 (優化版本)
+# Webhook 路由
 # ---------------------------------
 @app.route("/callback", methods=['POST'])
 def callback():
-    """處理 LINE Webhook 回調，增加錯誤處理"""
+    """處理 LINE Webhook 回調"""
     try:
         signature = request.headers.get('X-Line-Signature')
         if not signature:
-            logger.error("No signature found in request headers")
+            logger.error("No signature found")
             abort(400)
             
         body = request.get_data(as_text=True)
-        logger.info(f"Received callback request, body length: {len(body)}")
-        
         handler.handle(body, signature)
         return 'OK'
         
     except InvalidSignatureError:
-        logger.error("Invalid signature. Please check your channel secret.")
+        logger.error("Invalid signature")
         abort(400)
     except Exception as e:
         logger.error(f"Error in callback: {e}")
         abort(500)
 
 # ---------------------------------
-# 核心訊息處理邏輯 (優化版本)
+# 核心訊息處理邏輯
 # ---------------------------------
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    """處理文字訊息，增加錯誤處理和超時保護"""
+    """處理文字訊息"""
     try:
         text = event.message.text.strip()
         creator_user_id = event.source.user_id
@@ -396,8 +390,7 @@ def handle_message(event):
                 profile = line_bot_api.get_profile(creator_user_id)
                 target_user_id = creator_user_id
                 target_display_name = profile.display_name
-            except LineBotApiError as e:
-                logger.error(f"Could not get profile for user {creator_user_id}: {e}")
+            except LineBotApiError:
                 target_user_id = creator_user_id
                 target_display_name = "您"
         else:
@@ -466,11 +459,11 @@ def handle_message(event):
             pass
 
 # ---------------------------------
-# Postback 事件處理 (優化版本)
+# Postback 事件處理
 # ---------------------------------
 @handler.add(PostbackEvent)
 def handle_postback(event):
-    """處理 Postback 事件，增加錯誤處理"""
+    """處理 Postback 事件"""
     try:
         data = dict(x.split('=') for x in event.postback.data.split('&'))
         action = data.get('action')
@@ -604,6 +597,7 @@ def cleanup():
         if scheduler.running:
             scheduler.shutdown()
             logger.info("Scheduler shut down successfully")
+        cleanup_db()
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
 
@@ -615,7 +609,7 @@ atexit.register(cleanup)
 # 主程式進入點
 # ---------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get('PORT', 5001))
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
     
     
